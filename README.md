@@ -33,13 +33,13 @@ Full documentation at **[docs.arkonis.dev](https://docs.arkonis.dev)**.
   ```bash
   helm repo add arkonis https://arkonis-dev.github.io/helm-charts
   helm repo update
-  helm install ark arkonis/ark --namespace ark-system --create-namespace
-  kubectl create secret generic my-ark-secrets \
+  kubectl create secret generic ark-api-keys \
     --namespace ark-system \
+    --create-namespace \
     --from-literal=ANTHROPIC_API_KEY=sk-ant-...
-  helm upgrade ark arkonis/ark \
+  helm install ark arkonis/ark \
     --namespace ark-system \
-    --set apiKeys.existingSecret=my-ark-secrets
+    --set apiKeys.existingSecret=ark-api-keys
   ```
 
 For recipe 03 (autoscaling): KEDA must be installed - see [keda.sh/docs/deploy](https://keda.sh/docs/deploy/).
