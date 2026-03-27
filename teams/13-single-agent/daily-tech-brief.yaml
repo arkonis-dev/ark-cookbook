@@ -1,0 +1,84 @@
+# 13-single-agent - Daily Tech Brief
+#
+# A single-agent pipeline that generates a structured tech brief for a given topic.
+# The simplest possible ark setup: one role, one step, one output.
+#
+# Features demonstrated:
+#   - Single role (no dependsOn needed)
+#   - spec.inputs with required/optional fields
+#   - outputSchema (structured JSON output)
+#   - Minimal limits configuration
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f daily-tech-brief.yaml
+#
+# Trigger:
+#   ark trigger daily-tech-brief -n ark-teams \
+#     --input '{"topic":"AI agents in Kubernetes"}'
+
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: daily-tech-brief
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 120
+
+  inputs:
+    - name: topic
+      type: string
+      description: "The tech topic to generate a brief for."
+      required: true
+    - name: audience
+      type: string
+      description: "Target audience for the brief."
+      required: false
+      default: "software engineers"
+
+  roles:
+    - name: analyst
+      model: claude-sonnet-4-20250514
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a tech analyst. You produce concise, structured briefs on technology topics.
+        Always respond with valid JSON only. No explanation, no markdown, no code fences.
+      limits:
+        maxTokensPerCall: 600
+        timeoutSeconds: 60
+
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+
+  pipeline:
+    - role: analyst
+      inputs:
+        prompt: |
+          Generate a daily tech brief on "{{ .input.topic }}" for {{ .input.audience }}.
+          Return JSON only:
+          {
+            "topic": "...",
+            "summary": "2-3 sentence overview",
+            "trends": ["trend 1", "trend 2", "trend 3"],
+            "talkingPoints": ["point 1", "point 2", "point 3"]
+          }
+      outputSchema: |
+        {
+          "type": "object",
+          "properties": {
+            "topic":         { "type": "string" },
+            "summary":       { "type": "string" },
+            "trends":        { "type": "array", "items": { "type": "string" }, "minItems": 3, "maxItems": 3 },
+            "talkingPoints": { "type": "array", "items": { "type": "string" }, "minItems": 3, "maxItems": 3 }
+          },
+          "required": ["topic", "summary", "trends", "talkingPoints"]
+        }
+
+  output: "{{ .steps.analyst.output }}"

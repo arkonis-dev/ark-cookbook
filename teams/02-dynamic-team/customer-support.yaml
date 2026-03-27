@@ -1,0 +1,170 @@
+# 02-dynamic-team - Customer Support
+#
+# A coordinator receives incoming support tickets and autonomously decides
+# which specialist to delegate to - billing, technical, or escalation.
+# There is no fixed execution order; the coordinator reasons about the ticket
+# and routes dynamically using the built-in delegate() tool.
+#
+# Features demonstrated:
+#   - Dynamic mode (autonomous delegation, no pipeline block)
+#   - entry role (receives external tasks via auto-created ArkService)
+#   - canDelegate (explicit delegation graph)
+#   - delegate() built-in tool injected into coordinator at runtime
+#   - Per-role replicas (scale specialists independently)
+#   - ArkService for external task submission
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f customer-support.yaml
+#
+# Submit a ticket via the auto-created ArkService (HTTP port 8081):
+#   curl -X POST http://<arkservice-ip>:8081/task \
+#     -H "Content-Type: application/json" \
+#     -d '{"prompt": "My invoice shows a double charge for last month."}'
+#
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: customer-support-team
+  namespace: ark-teams
+spec:
+  # entry names the role that receives all inbound tasks from the ArkService.
+  # The operator auto-creates an ArkService named "customer-support-team-entry".
+  entry: coordinator
+
+  roles:
+    # The coordinator receives every ticket and decides routing.
+    # It has access to delegate() for billing, technical, and escalation.
+    - name: coordinator
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a customer support coordinator. Your job is to read the incoming
+        support ticket, classify it, and delegate it to the right specialist:
+
+        - Use delegate("billing") for payment, invoice, subscription, or refund issues.
+        - Use delegate("technical") for bugs, errors, integrations, or product questions.
+        - Use delegate("escalation") for legal threats, data breaches, executive requests,
+          or any issue that requires manager involvement.
+
+        Always delegate - never try to resolve the issue yourself.
+        Before delegating, briefly summarize why you chose that specialist.
+      canDelegate:
+        - billing
+        - technical
+        - escalation
+      limits:
+        maxTokensPerCall: 2000
+        timeoutSeconds: 180
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # Billing specialist - handles financial issues.
+    - name: billing
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a billing support specialist. Resolve payment, invoice, subscription,
+        and refund issues. Be empathetic, precise, and provide clear next steps.
+        Always confirm the resolution before closing the ticket.
+      replicas: 3
+      limits:
+        maxTokensPerCall: 3000
+        timeoutSeconds: 180
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # Technical specialist - handles product and integration issues.
+    - name: technical
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a technical support specialist. Diagnose and resolve bugs, errors,
+        API integration problems, and general product questions. Provide step-by-step
+        instructions. If the issue requires an engineer, say so clearly.
+      replicas: 5
+      limits:
+        maxTokensPerCall: 4000
+        timeoutSeconds: 180
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      mcpServers:
+        - name: knowledge-base
+          url: https://kb.mcp.example.com/sse
+          # guidance provides deployment-specific context for this MCP server.
+          # The operator injects this as a "## MCP Tool Guidance" section in the
+          # assembled system prompt so the LLM knows how to use the tool correctly
+          # in this environment. General tool documentation belongs in the MCP
+          # server's own tool descriptions.
+          guidance: |
+            This is the internal knowledge base for Acme Corp products. Articles
+            are tagged by product line (billing, api, onboarding). Search by
+            product + symptom for best results. Articles updated weekly - check
+            the "updated_at" field before citing version-specific instructions.
+
+    # Escalation specialist - handles sensitive or high-priority issues.
+    - name: escalation
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a senior escalation specialist. Handle legal threats, data privacy
+        concerns, executive-level requests, and situations requiring management review.
+        Document the issue thoroughly, acknowledge urgency, and outline the escalation
+        path with a clear timeline.
+      replicas: 1
+      limits:
+        maxTokensPerCall: 4000
+        timeoutSeconds: 180
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+---
+# ArkService exposes the team's entry role over HTTP and agent-to-agent (A2A) protocols.
+# The operator creates this automatically when spec.entry is set, but you can declare
+# it explicitly to customize routing strategy or ports.
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkService
+metadata:
+  name: customer-support-entry
+  namespace: ark-teams
+spec:
+  selector:
+    arkAgent: customer-support-team-coordinator
+  routing:
+    strategy: least-busy   # round-robin | least-busy | random
+  ports:
+    - protocol: A2A
+      port: 8080
+    - protocol: HTTP
+      port: 8081

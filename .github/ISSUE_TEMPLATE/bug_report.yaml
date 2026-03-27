@@ -1,0 +1,63 @@
+name: Bug Report
+description: Report an issue with a cookbook recipe
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue. Please fill in as much detail as possible.
+        **Redact any API keys or secrets before submitting.**
+
+  - type: input
+    id: recipe
+    attributes:
+      label: Recipe
+      placeholder: "teams/01-simple-pipeline"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ark run teams/01-simple-pipeline/team.yaml --provider mock
+        2. See error: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Full terminal output
+      render: shell
+
+  - type: input
+    id: ark-version
+    attributes:
+      label: ark version
+      description: "`ark version`"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: coc
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: I have read and agree to the [Code of Conduct](https://github.com/arkonis-dev/ark/blob/main/CODE_OF_CONDUCT.md)
+          required: true

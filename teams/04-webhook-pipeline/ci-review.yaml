@@ -1,0 +1,302 @@
+# 04-webhook-pipeline - CI/CD Code Review on Pull Request
+#
+# A GitHub webhook fires when a pull request is opened or updated.
+# One webhook event fans out to two independent review teams in parallel:
+#   1. security-scan-team  - checks for vulnerabilities, secrets, and bad patterns
+#   2. quality-review-team - checks code style, test coverage gaps, and complexity
+#
+# Features demonstrated:
+#   - ArkEvent with webhook source (HTTP endpoint, Bearer token auth)
+#   - Fan-out: one trigger dispatches multiple teams in parallel
+#   - {{ .trigger.body.* }} template access to the POST payload
+#   - Inline HTTP tools (no MCP server needed for simple API calls)
+#   - Loop step (retry analysis until confidence threshold met)
+#   - ArkEvent status.webhookURL for the live endpoint
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f ci-review.yaml
+#
+# After applying, get the webhook URL and token:
+#   kubectl get arkevent pr-review-webhook -o jsonpath='{.status.webhookURL}'
+#   kubectl get secret pr-review-webhook-webhook-token \
+#     -o jsonpath='{.data.token}' | base64 -d
+#
+# Configure in GitHub:
+#   Settings → Webhooks → Add webhook
+#   Payload URL: <status.webhookURL>
+#   Content type: application/json
+#   Secret: (leave blank - auth is Bearer token in header)
+#   Events: Pull requests
+#
+# Or test manually:
+#   curl -X POST "$WEBHOOK_URL" \
+#     -H "Authorization: Bearer $TOKEN" \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "pr_number": 42,
+#       "repo": "my-org/my-service",
+#       "branch": "feat/new-auth",
+#       "diff_url": "https://github.com/my-org/my-service/pull/42.diff",
+#       "author": "alice"
+#     }'
+#
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkEvent
+metadata:
+  name: pr-review-webhook
+  namespace: ark-teams
+spec:
+  source:
+    type: webhook
+  # Fan-out: both teams are triggered in parallel from the same webhook event.
+  targets:
+    - team: security-scan-team
+      input:
+        prNumber:  "{{ .trigger.body.pr_number }}"
+        repo:      "{{ .trigger.body.repo }}"
+        branch:    "{{ .trigger.body.branch }}"
+        diffUrl:   "{{ .trigger.body.diff_url }}"
+        author:    "{{ .trigger.body.author }}"
+    - team: quality-review-team
+      input:
+        prNumber:  "{{ .trigger.body.pr_number }}"
+        repo:      "{{ .trigger.body.repo }}"
+        branch:    "{{ .trigger.body.branch }}"
+        diffUrl:   "{{ .trigger.body.diff_url }}"
+  # Allow concurrent runs - multiple PRs can be reviewed simultaneously.
+  concurrencyPolicy: Allow
+  suspended: false
+---
+# Team 1: Security scanning pipeline
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: security-scan-team
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 300
+
+  inputs:
+    - name: prNumber
+      type: string
+      required: true
+    - name: repo
+      type: string
+      required: true
+    - name: branch
+      type: string
+      required: true
+    - name: diffUrl
+      type: string
+      required: true
+    - name: author
+      type: string
+      required: false
+      default: "unknown"
+
+  roles:
+    - name: fetcher
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a code fetcher agent. Retrieve the diff content from the provided
+        URL and return the raw diff text. If the fetch fails, return an error message.
+      limits:
+        maxTokensPerCall: 2000
+        timeoutSeconds: 30
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      tools:
+        - name: fetch_diff
+          description: "Fetch the raw diff content from a GitHub PR diff URL."
+          url: "https://api.github.com/repos/{{ .input.repo }}/pulls/{{ .input.prNumber }}"
+          method: GET
+          inputSchema: |
+            {"type": "object", "properties": {}}
+
+    - name: scanner
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a security code reviewer. Analyze diffs for:
+        - Hardcoded secrets, API keys, or passwords
+        - SQL injection, XSS, or command injection vulnerabilities
+        - Insecure dependencies or imports
+        - Authentication or authorization bypasses
+        - Sensitive data exposure
+
+        Rate each finding as: CRITICAL, HIGH, MEDIUM, or LOW.
+        Return structured JSON with your findings.
+      limits:
+        maxTokensPerCall: 8000
+        timeoutSeconds: 120
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    - name: reporter
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a report formatter. Take security scan findings and produce
+        a concise, actionable GitHub PR comment. Format it as Markdown.
+        Lead with a summary verdict: ✅ PASSED, ⚠️ WARNINGS, or ❌ BLOCKED.
+      limits:
+        maxTokensPerCall: 3000
+        timeoutSeconds: 60
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      tools:
+        - name: post_pr_comment
+          description: "Post a comment on a GitHub pull request."
+          url: "https://api.github.com/repos/{{ .input.repo }}/issues/{{ .input.prNumber }}/comments"
+          method: POST
+          inputSchema: |
+            {
+              "type": "object",
+              "properties": {
+                "body": { "type": "string", "description": "The Markdown comment body." }
+              },
+              "required": ["body"]
+            }
+
+  pipeline:
+    # Note: step name = role name. Reference outputs via {{ .steps.<roleName>.output }}.
+
+    - role: fetcher
+      inputs:
+        prompt: "Fetch the diff for PR #{{ .input.prNumber }} in {{ .input.repo }} from: {{ .input.diffUrl }}"
+
+    - role: scanner
+      dependsOn: [fetcher]
+      inputs:
+        prompt: |
+          Review this diff for security issues. PR #{{ .input.prNumber }} by {{ .input.author }}
+          on branch {{ .input.branch }} in {{ .input.repo }}.
+
+          Diff:
+          {{ .steps.fetcher.output }}
+
+          Return JSON: {"verdict": "passed|warnings|blocked", "findings": [{"severity": "...", "description": "...", "line": "..."}]}
+      outputSchema: |
+        {
+          "type": "object",
+          "properties": {
+            "verdict":  { "type": "string", "enum": ["passed", "warnings", "blocked"] },
+            "findings": { "type": "array" }
+          },
+          "required": ["verdict", "findings"]
+        }
+
+    - role: reporter
+      dependsOn: [scanner]
+      inputs:
+        prompt: |
+          Format these security findings as a GitHub PR comment and post it.
+          PR: #{{ .input.prNumber }} in {{ .input.repo }}
+          Findings: {{ .steps.scanner.output }}
+
+  output: "{{ .steps.scanner.output }}"
+---
+# Team 2: Code quality review pipeline
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: quality-review-team
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 300
+
+  inputs:
+    - name: prNumber
+      type: string
+      required: true
+    - name: repo
+      type: string
+      required: true
+    - name: branch
+      type: string
+      required: true
+    - name: diffUrl
+      type: string
+      required: true
+
+  roles:
+    - name: reviewer
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a code quality reviewer. Analyze diffs for:
+        - Missing or insufficient test coverage
+        - Overly complex functions (cyclomatic complexity)
+        - Code duplication and DRY violations
+        - Naming conventions and readability
+        - Missing error handling
+        - Performance anti-patterns
+
+        Be constructive and specific. Suggest improvements, not just problems.
+        Return structured JSON with findings and suggestions.
+      limits:
+        maxTokensPerCall: 8000
+        timeoutSeconds: 120
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      tools:
+        - name: post_review_comment
+          description: "Post a review comment on a GitHub pull request."
+          url: "https://api.github.com/repos/{{ .input.repo }}/pulls/{{ .input.prNumber }}/reviews"
+          method: POST
+          inputSchema: |
+            {
+              "type": "object",
+              "properties": {
+                "body":  { "type": "string" },
+                "event": { "type": "string", "enum": ["COMMENT", "REQUEST_CHANGES", "APPROVE"] }
+              },
+              "required": ["body", "event"]
+            }
+
+  pipeline:
+    - role: reviewer
+      inputs:
+        prompt: |
+          Review this PR diff for code quality. Fetch the diff from {{ .input.diffUrl }}
+          and analyze it for quality issues. Post your review as a GitHub PR review comment
+          on PR #{{ .input.prNumber }} in {{ .input.repo }}.
+
+          Use event: "COMMENT" for suggestions, "REQUEST_CHANGES" for blocking issues,
+          or "APPROVE" if the code looks good.
+
+  output: "{{ .steps.reviewer.output }}"

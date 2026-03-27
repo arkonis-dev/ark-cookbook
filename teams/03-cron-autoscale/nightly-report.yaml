@@ -1,0 +1,217 @@
+# 03-cron-autoscale - Nightly Market Report with KEDA Autoscaling
+#
+# A cron event fires every night, submitting tasks to a report pipeline.
+# Worker agents are scaled to 0 when idle and scale up automatically
+# (via KEDA) as tasks accumulate in the queue. A daily token budget
+# prevents runaway spend, and agents scale back to 0 once the budget
+# is exhausted or the queue drains.
+#
+# Features demonstrated:
+#   - ArkEvent with cron source (fires on schedule)
+#   - spec.autoscaling (KEDA ScaledObject, minReplicas: 0)
+#   - targetPendingTasks (scale trigger threshold)
+#   - maxDailyTokens (rolling 24h token budget → scale-to-zero backstop)
+#   - spec.inputs with defaults (reportDate injected by trigger)
+#   - Multi-step pipeline with conditional final step
+#
+# Prerequisites:
+#   - KEDA installed in your cluster (https://keda.sh/docs/deploy/)
+#   - Redis reachable at the TASK_QUEUE_URL configured in the operator
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f nightly-report.yaml
+#
+# The cron fires automatically. To trigger manually for testing:
+#   ark trigger nightly-report-team -n ark-teams \
+#     --input '{"reportDate":"2026-03-20","includeForecasts":"true"}'
+#
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: nightly-report-team
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 900  # 15 minutes max per run
+
+  inputs:
+    - name: reportDate
+      type: string
+      description: "Date the report covers (YYYY-MM-DD). Injected by the cron trigger."
+      required: true
+    - name: includeForecasts
+      type: string
+      description: "Whether to include forward-looking forecasts."
+      required: false
+      default: "true"
+
+  roles:
+    # Data collector - fetches raw market data via MCP tools.
+    # Scaled to 0 when idle; KEDA scales it up as tasks arrive.
+    - name: collector
+      model: claude-haiku-4-5-20251001
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a market data collection agent. Fetch and normalize raw market data
+        for the given date. Return structured JSON with price movements, volume,
+        and notable events.
+      limits:
+        maxTokensPerCall: 4000
+        timeoutSeconds: 120
+        # Rolling 24h token budget. When reached, the agent rejects new tasks
+        # immediately and the operator scales replicas to 0 as a backstop.
+        # Resets automatically when the 24h window rotates.
+        maxDailyTokens: 200000
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      autoscaling:
+        enabled: true
+        minReplicas: 0       # Scale to zero when no tasks pending
+        maxReplicas: 10      # Burst up to 10 pods during heavy load
+        targetPendingTasks: 3  # Scale up when >3 tasks are waiting per replica
+      mcpServers:
+        - name: market-data
+          url: https://marketdata.mcp.example.com/sse
+          guidance: |
+            Returns OHLCV data for equities and ETFs. Use the `snapshot` tool
+            for end-of-day data; use `history` for multi-day ranges (max 90 days).
+            All timestamps are UTC. Prices are in USD. Rate limit: 100 req/min.
+
+    # Analyst - interprets the collected data and writes the report narrative.
+    - name: analyst
+      model: claude-sonnet-4-6
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a market analyst. Given normalized market data, write a concise
+        nightly report covering: top movers, key themes, and risk signals.
+        Format the output as a structured JSON report.
+      limits:
+        maxTokensPerCall: 6000
+        timeoutSeconds: 180
+        maxDailyTokens: 500000
+
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+      autoscaling:
+        enabled: true
+        minReplicas: 0
+        maxReplicas: 5
+        targetPendingTasks: 2
+
+    # Forecaster - optional step: generate forward-looking forecasts.
+    - name: forecaster
+      model: claude-sonnet-4-6
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a market forecasting agent. Given yesterday's report, generate
+        short-term (1-3 day) price movement forecasts with confidence scores.
+        Return structured JSON.
+      limits:
+        maxTokensPerCall: 4000
+        timeoutSeconds: 120
+        maxDailyTokens: 300000
+
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+      autoscaling:
+        enabled: true
+        minReplicas: 0
+        maxReplicas: 3
+        targetPendingTasks: 2
+
+  pipeline:
+    # Note: step name = role name. Reference outputs via {{ .steps.<roleName>.output }}.
+
+    - role: collector
+      inputs:
+        prompt: |
+          Collect all market data for {{ .input.reportDate }}.
+          Return JSON: {"prices": [...], "volume": [...], "events": [...]}
+      outputSchema: |
+        {
+          "type": "object",
+          "properties": {
+            "prices": { "type": "array" },
+            "volume": { "type": "array" },
+            "events": { "type": "array" }
+          },
+          "required": ["prices", "volume", "events"]
+        }
+
+    - role: analyst
+      dependsOn: [collector]
+      inputs:
+        prompt: |
+          Analyze the following market data for {{ .input.reportDate }} and write
+          the nightly report:
+
+          {{ .steps.collector.output }}
+
+          Return JSON: {"headline": "...", "topMovers": [...], "themes": [...], "risks": [...]}
+      outputSchema: |
+        {
+          "type": "object",
+          "properties": {
+            "headline":   { "type": "string" },
+            "topMovers":  { "type": "array" },
+            "themes":     { "type": "array" },
+            "risks":      { "type": "array" }
+          },
+          "required": ["headline", "topMovers", "themes", "risks"]
+        }
+
+    # Only runs when includeForecasts is "true".
+    - role: forecaster
+      dependsOn: [analyst]
+      if: '{{ eq .input.includeForecasts "true" }}'
+      inputs:
+        prompt: |
+          Based on this report for {{ .input.reportDate }}, generate 1-3 day forecasts:
+
+          {{ .steps.analyst.output }}
+
+          Return JSON: {"forecasts": [{"asset": "...", "direction": "up|down|flat", "confidence": 0.0-1.0}]}
+
+  output: |
+    {{ if eq .input.includeForecasts "true" }}{{ .steps.forecaster.output }}{{ else }}{{ .steps.analyst.output }}{{ end }}
+---
+# ArkEvent - fires the nightly report pipeline on a cron schedule.
+# Injects reportDate from the trigger's firedAt timestamp.
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkEvent
+metadata:
+  name: nightly-report-cron
+  namespace: ark-teams
+spec:
+  source:
+    type: cron
+    cron: "0 0 * * *"  # Midnight UTC every day
+  targets:
+    - team: nightly-report-team
+      input:
+        reportDate: "{{ .trigger.firedAt }}"
+        includeForecasts: "true"
+  # Forbid concurrent runs - if the previous night's run is still going, skip.
+  concurrencyPolicy: Forbid
+  suspended: false

@@ -1,0 +1,172 @@
+# 12-self-optimizing-pipeline - Research Team with ArkOptimizer
+#
+# A two-step research pipeline that automatically improves its own prompts.
+# The ArkOptimizer watches run history, identifies the worst-performing step,
+# dispatches a meta-agent to propose a revised prompt, and A/B tests the proposal
+# as a shadow team against 15% of live traffic.
+#
+# Features demonstrated:
+#   - ArkTeam pipeline (researcher → summarizer)
+#   - validate: blocks so the optimizer has failure signal to work with
+#   - ArkOptimizer with promotionPolicy: manual (requires ark optimize approve)
+#   - Shadow A/B testing via ArkService weighted routing
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f research-team.yaml
+#
+# Trigger a few runs to build history:
+#   ark trigger research-team -n ark-teams \
+#     --input '{"topic": "Kubernetes operator patterns"}'
+#
+# After 15+ runs check the optimizer:
+#   ark optimize status research-team -n ark-teams
+#
+# When a proposal is pending:
+#   ark optimize approve research-team -n ark-teams --reason "shadow looks good"
+#   # or
+#   ark optimize discard research-team -n ark-teams
+#
+---
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: research-team
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 300
+  maxTokens: 20000
+
+  inputs:
+    - name: topic
+      type: string
+      description: "The topic to research and summarize."
+      required: true
+
+  roles:
+    - name: researcher
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a research agent. For every topic you investigate:
+        1. Identify the 3 most important aspects.
+        2. Provide a concrete example for each aspect.
+        3. Cite at least 2 well-known sources or references.
+
+        Always structure your response as:
+        - **Aspect 1:** ...
+        - **Aspect 2:** ...
+        - **Aspect 3:** ...
+      limits:
+        maxTokensPerCall: 8000
+        timeoutSeconds: 120
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    - name: summarizer
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a concise summarizer. Take research findings and distill them into
+        a 3-bullet executive summary. Each bullet must be one sentence.
+        Begin your response with "## Summary" on the first line.
+      limits:
+        maxTokensPerCall: 2000
+        timeoutSeconds: 60
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+  pipeline:
+    - role: researcher
+      inputs:
+        prompt: |
+          Research the following topic thoroughly.
+          Topic: {{ .input.topic }}
+      validate:
+        # Optimizer will target this step if it fails here frequently.
+        contains: '(?i)\*\*Aspect'
+        onFailure: retry
+        maxRetries: 2
+
+    - role: summarizer
+      dependsOn: [researcher]
+      inputs:
+        prompt: |
+          Summarize the following research findings in 3 bullet points.
+
+          Research:
+          {{ .steps.researcher.output }}
+      validate:
+        contains: '^## Summary'
+        onFailure: retry
+        maxRetries: 2
+
+  output: "{{ .steps.summarizer.output }}"
+
+---
+# ArkService exposes the team for external triggers. The optimizer patches this
+# service to weighted routing when a shadow A/B test is active.
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkService
+metadata:
+  name: research-service
+  namespace: ark-teams
+spec:
+  selector:
+    arkAgent: research-team-researcher
+  routing:
+    strategy: round-robin
+  ports:
+    - protocol: HTTP
+      port: 8081
+
+---
+# ArkOptimizer watches the research-team and proposes prompt improvements.
+# By convention, name this "<team>-optimizer" so `ark optimize` commands work
+# without --optimizer flag.
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkOptimizer
+metadata:
+  name: research-team-optimizer
+  namespace: ark-teams
+spec:
+  targetTeam: research-team
+
+  # Wait for 15 completed runs before proposing anything.
+  minRuns: 3
+
+  # Route 15% of live traffic to the shadow team during A/B tests.
+  shadowTrafficPct: 3
+
+  # Require 8 shadow completions before deciding to promote or discard.
+  evaluationRuns: 8
+
+  # Require a 15 percentage-point improvement before promoting.
+  minSuccessRateDelta: "0.15"
+
+  # Human approval required - run `ark optimize approve research-team -n ark-teams`.
+  # Change to "auto" to promote winning prompts without human review.
+  promotionPolicy: manual
+
+  # Use a capable model for the meta-agent.
+  optimizerModel: qwen2.5:7b
+
+  optimizerBudget:
+    maxTokensPerCycle: 6000
+    maxCyclesPerDay: 3

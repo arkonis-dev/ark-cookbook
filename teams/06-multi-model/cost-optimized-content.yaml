@@ -1,0 +1,309 @@
+# 06-multi-model - Cost-Optimized Content Pipeline
+#
+# A content production pipeline that assigns each step to the cheapest model
+# capable of doing the work well. Expensive models (Sonnet) are reserved for
+# tasks requiring reasoning; lightweight models (Haiku, GPT-4o-mini) handle
+# classification, formatting, and simple transforms.
+#
+# Shared configuration (tone, format, audience) lives in ArkSettings so it
+# doesn't need to be repeated across role prompts. Roles reference it via
+# settingsRefs (RFC-0012).
+#
+# Features demonstrated:
+#   - Mixed models per role (claude-haiku, claude-sonnet, gpt-4o-mini)
+#   - ArkSettings with composable named fragments (RFC-0012)
+#   - settingsRefs on roles - no annotation hack needed
+#   - MCPServerSpec.guidance for deployment-specific tool instructions
+#   - MCPServerSpec.auth with bearer token from a k8s Secret (RFC-0016 Phase 5)
+#   - networkPolicy.mode: strict on the role that calls external MCP servers (RFC-0016)
+#   - Conditional step: deep-research only runs for long-form content
+#   - Per-role token limits sized to the task complexity
+#   - spec.resources on every role (required to avoid webhook warnings)
+#   - Provider auto-detection: claude-* → anthropic, gpt-* → openai
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f cost-optimized-content.yaml
+#
+# Trigger:
+#   ark trigger content-pipeline-team -n ark-teams \
+#     --input '{
+#       "topic": "How KEDA autoscaling works with AI agent workloads",
+#       "format": "blog",
+#       "length": "long"
+#     }'
+#
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkSettings
+metadata:
+  name: content-pipeline-config
+  namespace: ark-teams
+spec:
+  temperature: "0.7"
+  outputFormat: "markdown"
+  # Named fragments replace the deprecated promptFragments.persona/outputRules fields.
+  # position=prepend injects before the role's systemPrompt; append injects after.
+  fragments:
+    - name: writing-persona
+      position: prepend
+      text: |
+        You are an expert technical writer for a developer-focused publication.
+        Write for an audience of senior engineers and platform teams.
+    - name: style-guide
+      position: prepend
+      text: |
+        Style guide:
+        - Use active voice. Keep sentences short.
+        - Prefer concrete examples over abstract explanations.
+        - Use code blocks for any technical syntax.
+        - Avoid buzzwords. Be direct and precise.
+    - name: output-rules
+      position: append
+      text: |
+        Always return clean Markdown. Do not include meta-commentary or preamble.
+        Start directly with the content.
+---
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: content-pipeline-team
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 600
+
+  inputs:
+    - name: topic
+      type: string
+      description: "The topic to create content about."
+      required: true
+    - name: format
+      type: string
+      description: "Content format: blog | tweet-thread | docs | changelog"
+      required: false
+      default: "blog"
+    - name: length
+      type: string
+      description: "Content length: short | medium | long"
+      required: false
+      default: "medium"
+
+  roles:
+    # Step 1: Classifier - cheapest model, simple task.
+    # Decides content angle and keywords. No reasoning needed.
+    - name: classifier
+      model: claude-haiku-4-5-20251001   # ~$0.25/MTok input - fastest, cheapest
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      settingsRefs:
+        - name: content-pipeline-config
+      systemPrompt: |
+        You are a content strategist. Given a topic and format, identify:
+        - The best content angle (tutorial, opinion, case-study, explainer)
+        - 5-7 target SEO keywords
+        - The key question the content should answer
+
+        Return compact JSON. Be decisive - one angle, not options.
+      limits:
+        maxTokensPerCall: 1000   # Classification is cheap
+        timeoutSeconds: 30
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # Step 2 (conditional): Deep researcher - only for long-form content.
+    # Uses Sonnet because it needs multi-step reasoning over complex topics.
+    - name: researcher
+      model: claude-sonnet-4-6           # ~$3/MTok input - reserved for hard reasoning
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      settingsRefs:
+        - name: content-pipeline-config
+      systemPrompt: |
+        You are a technical research specialist. Given a topic and content angle,
+        gather in-depth technical details, real-world examples, and authoritative
+        references. Structure your findings as a detailed research brief.
+      limits:
+        maxTokensPerCall: 8000
+        timeoutSeconds: 180
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+      # networkPolicy.mode: strict limits egress to only the listed MCP server URLs.
+      # Required when a role calls external services - prevents SSRF and data exfiltration.
+      networkPolicy:
+        mode: strict
+      mcpServers:
+        - name: web-search
+          url: https://search.mcp.example.com/sse
+          # auth.type: bearer reads the token from a k8s Secret at runtime.
+          # The operator injects it as AGENT_MCP_TOKEN_WEB_SEARCH - the token
+          # is never inlined in the pod spec or AGENT_MCP_SERVERS JSON.
+          # Create the secret: kubectl create secret generic mcp-web-search-token \
+          #   --from-literal=token=<your-token> -n ark-teams
+          auth:
+            type: bearer
+            tokenSecretRef:
+              name: mcp-web-search-token
+              key: token
+          # guidance is deployment-specific operational context for this MCP server.
+          # The operator appends this as a "## MCP Tool Guidance" section in the
+          # assembled system prompt. General tool docs belong in the server's own
+          # tool descriptions, not here.
+          guidance: |
+            Use this tool only for publicly accessible pages. Do not attempt
+            to access internal services, staging environments, or pages behind
+            authentication. Prefer primary sources (official docs, peer-reviewed
+            papers) over aggregator sites.
+
+    # Step 3: Outline writer - mid-tier model, structured task.
+    # GPT-4o-mini is excellent for structured outline generation at low cost.
+    - name: outliner
+      model: gpt-4o-mini                 # ~$0.15/MTok input - great for structured output
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      settingsRefs:
+        - name: content-pipeline-config
+      systemPrompt: |
+        You are a content architect. Given a topic, content angle, and optional
+        research brief, produce a detailed content outline with:
+        - A compelling headline
+        - Section headings with one-line descriptions
+        - Estimated word count per section
+
+        Return JSON: {"headline": "...", "sections": [{"heading": "...", "description": "...", "words": 0}]}
+      limits:
+        maxTokensPerCall: 2000
+        timeoutSeconds: 60
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # Step 4: Writer - Sonnet for the heavy creative lift.
+    - name: writer
+      model: claude-sonnet-4-6
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      settingsRefs:
+        - name: content-pipeline-config
+      systemPrompt: |
+        You are a senior technical writer. Write authoritative, engaging content
+        that follows the provided outline exactly. Match the tone and style of
+        the best developer-focused blogs (e.g. Stripe, Vercel, Cloudflare).
+      limits:
+        maxTokensPerCall: 8000
+        timeoutSeconds: 180
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+
+    # Step 5: Polish - Haiku for the final light editing pass.
+    # Grammar, readability, and formatting checks don't need a powerful model.
+    - name: polisher
+      model: claude-haiku-4-5-20251001
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      settingsRefs:
+        - name: content-pipeline-config
+      systemPrompt: |
+        You are a copy editor. Make a light pass over the provided content:
+        - Fix grammar and spelling
+        - Ensure consistent formatting
+        - Verify all Markdown renders correctly
+        - Tighten wordy sentences
+
+        Return the final content only. No commentary.
+      limits:
+        maxTokensPerCall: 6000
+        timeoutSeconds: 60
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+  pipeline:
+    # Note: step name = role name. Reference outputs via {{ .steps.<roleName>.output }}.
+
+    - role: classifier
+      inputs:
+        prompt: |
+          Classify this content request:
+          Topic: {{ .input.topic }}
+          Format: {{ .input.format }}
+          Length: {{ .input.length }}
+      outputSchema: |
+        {
+          "type": "object",
+          "properties": {
+            "angle":       { "type": "string" },
+            "keywords":    { "type": "array", "items": { "type": "string" } },
+            "keyQuestion": { "type": "string" }
+          },
+          "required": ["angle", "keywords", "keyQuestion"]
+        }
+
+    # Deep research - long-form only; skipped for short/medium to save cost.
+    - role: researcher
+      dependsOn: [classifier]
+      if: '{{ eq .input.length "long" }}'
+      inputs:
+        prompt: |
+          Research this topic deeply for a {{ .input.format }} post.
+          Angle: {{ .steps.classifier.data.angle }}
+          Key question to answer: {{ .steps.classifier.data.keyQuestion }}
+          Topic: {{ .input.topic }}
+
+    - role: outliner
+      dependsOn: [classifier, researcher]
+      inputs:
+        prompt: |
+          Create a detailed outline for a {{ .input.length }} {{ .input.format }}.
+          Topic: {{ .input.topic }}
+          Angle: {{ .steps.classifier.data.angle }}
+          Keywords to target: {{ .steps.classifier.data.keywords }}
+          {{ if eq .input.length "long" }}Research brief:
+          {{ .steps.researcher.output }}{{ end }}
+
+    - role: writer
+      dependsOn: [outliner]
+      inputs:
+        prompt: |
+          Write a {{ .input.length }} {{ .input.format }} following this outline exactly.
+          Topic: {{ .input.topic }}
+          Outline: {{ .steps.outliner.output }}
+          {{ if eq .input.length "long" }}Reference material:
+          {{ .steps.researcher.output }}{{ end }}
+
+    - role: polisher
+      dependsOn: [writer]
+      inputs:
+        prompt: |
+          Make a final editing pass on this {{ .input.format }}. Fix any issues
+          and return the publication-ready content.
+
+          {{ .steps.writer.output }}
+
+  output: "{{ .steps.polisher.output }}"

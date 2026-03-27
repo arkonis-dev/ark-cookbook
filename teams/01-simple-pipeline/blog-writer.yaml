@@ -1,0 +1,132 @@
+# 01-simple-pipeline - Blog Writer
+#
+# A three-step linear pipeline: researcher -> writer -> editor.
+# Each step's output feeds directly into the next step's input.
+#
+# Features demonstrated:
+#   - Pipeline mode (deterministic DAG execution)
+#   - dependsOn (step ordering); step name = role name
+#   - Template inputs: {{ .input.* }} and {{ .steps.<role>.output }}
+#   - outputSchema (JSON Schema validation on step output)
+#   - spec.inputs with required fields and defaults (requires CRDs >= v0.13.0)
+#   - Flow-level timeoutSeconds
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f blog-writer.yaml
+#
+# Trigger:
+#   ark trigger blog-writer-team -n ark-teams \
+#     --input '{"topic":"The rise of AI agents in Kubernetes","audience":"platform engineers"}'
+
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: blog-writer-team
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 600
+
+  inputs:
+    - name: topic
+      type: string
+      description: "The blog post topic."
+      required: true
+    - name: audience
+      type: string
+      description: "Target audience for the post."
+      required: false
+      default: "software engineers"
+
+  roles:
+    - name: researcher
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a research specialist. Return findings as JSON only. No explanation.
+      limits:
+        maxTokensPerCall: 500
+        timeoutSeconds: 300
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    - name: writer
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a blog writer. Write short, clear posts. 3 paragraphs max.
+      limits:
+        maxTokensPerCall: 800
+        timeoutSeconds: 300
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    - name: editor
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a copy editor. Fix grammar and flow. Return the improved text only.
+      limits:
+        maxTokensPerCall: 800
+        timeoutSeconds: 300
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+  pipeline:
+    # Note: step identity = role name. Reference outputs via {{ .steps.<roleName>.output }}.
+
+    - role: researcher
+      inputs:
+        prompt: |
+          List 3 key points about "{{ .input.topic }}" for {{ .input.audience }}.
+          Return JSON only: {"keyPoints": ["...", "...", "..."], "tone": "..."}
+      outputSchema: |
+        {
+          "type": "object",
+          "properties": {
+            "keyPoints": { "type": "array", "items": { "type": "string" } },
+            "tone":      { "type": "string" }
+          },
+          "required": ["keyPoints", "tone"]
+        }
+
+    - role: writer
+      dependsOn: [researcher]
+      inputs:
+        prompt: |
+          Write a short blog post (3 paragraphs) for {{ .input.audience }} about "{{ .input.topic }}".
+          Key points to cover: {{ .steps.researcher.output }}
+
+    - role: editor
+      dependsOn: [writer]
+      inputs:
+        prompt: |
+          Fix any grammar or flow issues in this post. Return the improved text only.
+
+          {{ .steps.writer.output }}
+
+  output: "{{ .steps.editor.output }}"

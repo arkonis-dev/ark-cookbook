@@ -1,0 +1,242 @@
+# 08-budget-notify - Budget-Controlled Analytics with Slack Notifications
+#
+# An analytics team with tight cost controls and full operational visibility.
+# Daily token budgets prevent runaway spend. Slack alerts fire on budget
+# exhaustion, pipeline failures, and timeouts - so the team always knows
+# what's happening without watching dashboards.
+#
+# Features demonstrated:
+#   - maxDailyTokens (rolling 24h token budget per agent pod)
+#   - ArkNotify CRD (Slack channel with event-based triggers)
+#   - notifyRef on ArkTeam (route lifecycle events to notify channel)
+#   - Event types: BudgetExceeded, TeamFailed, TeamTimedOut, TeamSucceeded
+#   - Custom Slack message templates with context variables
+#   - Secret-based Slack webhook URL management
+#   - Rate limiting (avoid notification storms)
+#   - systemPromptRef from ConfigMap (large prompt, avoids etcd size limits)
+#
+# Apply:
+#   # 1. Add your Anthropic API key
+#   kubectl apply -f secret.yaml
+#
+#   # 2. Create the Slack webhook secret
+#   kubectl create secret generic analytics-slack-secret \
+#     --from-literal=webhookUrl=https://hooks.slack.com/services/T.../B.../... \
+#     -n ark-teams
+#
+#   # 3. Create the system prompt ConfigMap (optional - for large prompts)
+#   kubectl create configmap analytics-analyst-prompt \
+#     --from-file=system.txt=./prompts/analytics-analyst.md \
+#     -n ark-teams
+#
+#   # 4. Apply everything
+#   kubectl apply -f analytics-team.yaml
+#
+# Trigger:
+#   ark trigger analytics-team -n ark-teams \
+#     --input '{"dataset": "user_events_2026_q1", "question": "What drove the 15% drop in activation rate in week 10?"}'
+#
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkNotify
+metadata:
+  name: analytics-slack-alerts
+  namespace: ark-teams
+spec:
+  channel:
+    type: slack
+    slack:
+      webhookUrlSecretRef:
+        name: analytics-slack-secret
+        key: webhookUrl
+
+  # Events that trigger a notification.
+  events:
+    # Alert when a team fails - include the error reason in the message.
+    - type: TeamFailed
+      template: |
+        :x: *Analytics pipeline failed*
+        Team: `{{ .team.name }}`
+        Run: `{{ .run.name }}`
+        Reason: {{ .run.status.message }}
+        Failed step: {{ .run.status.failedStep }}
+        <{{ .run.dashboardUrl }}|View in dashboard>
+
+    # Alert when the pipeline times out.
+    - type: TeamTimedOut
+      template: |
+        :hourglass_flowing_sand: *Analytics pipeline timed out*
+        Team: `{{ .team.name }}`
+        Run: `{{ .run.name }}`
+        Elapsed: {{ .run.status.durationSeconds }}s
+        <{{ .run.dashboardUrl }}|View in dashboard>
+
+    # Alert when an agent hits its daily token budget.
+    # This fires before the operator scales replicas to 0 - gives time to react.
+    - type: BudgetExceeded
+      template: |
+        :moneybag: *Daily token budget exhausted*
+        Agent: `{{ .agent.name }}`
+        Budget: {{ .agent.spec.limits.maxDailyTokens | int | printf "%d" }} tokens
+        Used today: {{ .agent.status.dailyTokensUsed | int | printf "%d" }} tokens
+        Resets: in ~{{ .agent.status.budgetResetsInMinutes }} minutes
+        The operator will scale this agent to 0 replicas until the window resets.
+
+    # Confirmation on success - useful for audit trails.
+    - type: TeamSucceeded
+      template: |
+        :white_check_mark: *Analytics run completed*
+        Team: `{{ .team.name }}`
+        Question: {{ .run.spec.input.question }}
+        Duration: {{ .run.status.durationSeconds }}s
+        Tokens used: {{ .run.status.totalTokenUsage.totalTokens }}
+        <{{ .run.dashboardUrl }}|View results>
+
+  # Rate limiting: no more than 1 alert per (team, event-type) pair per 5 minutes.
+  # Prevents notification storms on flapping pipelines.
+  rateLimiting:
+    windowSeconds: 300
+    maxPerWindow: 1
+---
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: analytics-team
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 600
+
+  # Route lifecycle events to the Slack notify channel.
+  notifyRef:
+    name: analytics-slack-alerts
+
+  inputs:
+    - name: dataset
+      type: string
+      description: "The dataset or table to analyze."
+      required: true
+    - name: question
+      type: string
+      description: "The business question to answer."
+      required: true
+    - name: depth
+      type: string
+      description: "Analysis depth: quick | standard | deep"
+      required: false
+      default: "standard"
+
+  roles:
+    # Data analyst - queries data and interprets results.
+    # Prompt loaded from a ConfigMap to keep the CR small and allow
+    # prompt updates without touching the ArkTeam spec.
+    - name: analyst
+      model: claude-sonnet-4-6
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      # Load the system prompt from a ConfigMap key.
+      # Update the ConfigMap and the operator will restart pods automatically.
+      systemPromptRef:
+        configMapKeyRef:
+          name: analytics-analyst-prompt
+          key: system.txt
+      limits:
+        maxTokensPerCall: 8000
+        timeoutSeconds: 180
+        # Daily token budget: 1M tokens ≈ ~$3/day at Sonnet pricing.
+        # When reached, the agent rejects tasks immediately and the
+        # operator scales replicas to 0 until the 24h window resets.
+        maxDailyTokens: 1000000
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+      tools:
+        - name: run_query
+          description: "Execute a SQL query against the analytics warehouse and return results as JSON."
+          url: "http://analytics-gateway.internal/query"
+          method: POST
+          inputSchema: |
+            {
+              "type": "object",
+              "properties": {
+                "sql":     { "type": "string", "description": "The SQL query to run." },
+                "limit":   { "type": "integer", "default": 1000 },
+                "dataset": { "type": "string" }
+              },
+              "required": ["sql", "dataset"]
+            }
+        - name: get_schema
+          description: "Retrieve the schema for a dataset."
+          url: "http://analytics-gateway.internal/schema"
+          method: GET
+          inputSchema: |
+            {
+              "type": "object",
+              "properties": {
+                "dataset": { "type": "string" }
+              },
+              "required": ["dataset"]
+            }
+
+    # Reporter - formats findings into a business-readable report.
+    - name: reporter
+      model: claude-haiku-4-5-20251001
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      systemPrompt: |
+        You are a business intelligence reporter. Given analytical findings,
+        produce a concise executive summary in Markdown format. Structure it as:
+        - One-sentence answer to the question
+        - 3-5 key findings with supporting data
+        - Recommended actions
+        - Caveats or data quality notes (if any)
+      limits:
+        maxTokensPerCall: 3000
+        timeoutSeconds: 60
+        maxDailyTokens: 500000
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+  pipeline:
+    # Note: step name = role name. Reference outputs via {{ .steps.<roleName>.output }}.
+
+    - role: analyst
+      inputs:
+        prompt: |
+          Answer the following business question using the {{ .input.dataset }} dataset.
+
+          Question: {{ .input.question }}
+          Depth: {{ .input.depth }}
+
+          Start by fetching the dataset schema, then write and execute the queries needed
+          to answer the question. Explain your methodology and findings.
+      validate:
+        semantic: |
+          Does this analysis directly answer a specific business question with data?
+          Does it include actual query results or numbers, not just methodology?
+          Reply with exactly one word: VALID or INVALID.
+        onFailure: retry
+        maxRetries: 2
+
+    - role: reporter
+      dependsOn: [analyst]
+      inputs:
+        prompt: |
+          Format these analytical findings into an executive summary.
+          Original question: {{ .input.question }}
+          Dataset: {{ .input.dataset }}
+
+          Findings:
+          {{ .steps.analyst.output }}
+
+  output: "{{ .steps.reporter.output }}"

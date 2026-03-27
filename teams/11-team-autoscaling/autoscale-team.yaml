@@ -1,0 +1,159 @@
+# 11-team-autoscaling - Native Team Autoscaling (no KEDA required)
+#
+# The operator scales inline role agents based on the number of active pipeline steps.
+# When no runs are in progress, agents scale to 0 after 5 minutes. A new trigger
+# causes the step to enter WarmingUp phase until pods are ready, then proceeds normally.
+#
+# Features demonstrated:
+#   - spec.autoscaling.enabled on ArkTeam (team-owned autoscaling, no external autoscaler)
+#   - scaleToZero with afterSeconds idle timeout
+#   - WarmingUp step phase (visible in kubectl get arkruns -o wide)
+#   - role.limits.maxConcurrentTasks drives desired-replica calculation:
+#       desired = min(ceil(activeSteps / maxConcurrentTasks), role.replicas)
+#   - Conflict guard: roles with KEDA autoscaling (spec.autoscaling on ArkAgent) are untouched
+#
+# vs. KEDA autoscaling (03-cron-autoscale):
+#   - No KEDA installation required
+#   - Scales based on active *pipeline steps*, not queue depth
+#   - Scale-to-zero is tied to pipeline activity, not Redis stream length
+#   - Use KEDA when you need queue-depth-based scaling; use this for pipeline-aware scaling
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f autoscale-team.yaml -n ark-teams
+#
+# Trigger a run:
+#   ark trigger research-autoscale -n ark-teams \
+#     --input '{"topic":"neural network efficiency","audience":"ML engineers"}'
+#
+# Watch scale events:
+#   kubectl get events -n ark-teams --field-selector reason=AutoscaleAgent -w
+#
+# Check step WarmingUp state (visible when agents were at 0 replicas):
+#   kubectl get arkruns -n ark-teams -o wide
+#
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: research-autoscale
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 900
+
+  inputs:
+    - name: topic
+      type: string
+      required: true
+      description: "Research topic for the pipeline."
+    - name: audience
+      type: string
+      default: "general readers"
+      description: "Target audience for the final article."
+
+  # Team-owned autoscaling: no KEDA needed.
+  # The operator adjusts each inline role's replica count based on active pipeline steps.
+  autoscaling:
+    enabled: true
+    scaleToZero:
+      enabled: true
+      afterSeconds: 300   # scale idle roles to 0 after 5 minutes of inactivity
+
+  roles:
+    - name: researcher
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      # Max replicas - autoscaler scales between 0 and this value.
+      replicas: 2
+      systemPrompt: |
+        You are a research specialist. Gather information on the given topic and
+        return a structured summary with key findings and sources.
+      limits:
+        maxTokensPerCall: 6000
+        timeoutSeconds: 180
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+        # Used in desired-replica formula: desired = ceil(activeSteps / maxConcurrentTasks)
+        maxConcurrentTasks: 2
+
+    - name: writer
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      replicas: 2
+      systemPrompt: |
+        You are a skilled technical writer. Given research findings, write a clear,
+        engaging article tailored to the specified audience.
+      limits:
+        maxTokensPerCall: 8000
+        timeoutSeconds: 240
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+        maxConcurrentTasks: 1
+
+    - name: editor
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      replicas: 1
+      systemPrompt: |
+        You are a copy editor. Fix grammar, improve flow, and ensure the article
+        is polished and ready for publication. Return the improved text only.
+      limits:
+        maxTokensPerCall: 4000
+        timeoutSeconds: 120
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+        maxConcurrentTasks: 1
+
+  pipeline:
+    - role: researcher
+      inputs:
+        prompt: |
+          Research the following topic for {{ .input.audience }}:
+
+          {{ .input.topic }}
+
+          Return a structured summary with key findings, supporting evidence, and
+          3-5 specific recommendations.
+
+    - role: writer
+      dependsOn: [researcher]
+      inputs:
+        prompt: |
+          Write a clear, engaging article about "{{ .input.topic }}" for {{ .input.audience }}.
+          Base it on this research:
+
+          {{ .steps.researcher.output }}
+
+    - role: editor
+      dependsOn: [writer]
+      inputs:
+        prompt: |
+          Polish this article. Fix grammar, improve flow, and ensure it is ready
+          for publication. Return only the improved text.
+
+          {{ .steps.writer.output }}
+
+  output: "{{ .steps.editor.output }}"
