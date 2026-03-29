@@ -15,7 +15,7 @@ Each recipe lives in its own numbered directory under `teams/`:
 teams/
   NN-short-name/
     README.md            # What the recipe does, when to use it, how to run it
-    team.yaml            # The ArkFlow / ArkAgent / ArkService manifests
+    team.yaml            # The ArkTeam / ArkAgent / ArkEvent manifests
     values.yaml          # Optional: Helm overrides if the recipe needs custom settings
 ```
 

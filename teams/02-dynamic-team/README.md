@@ -13,16 +13,20 @@ A coordinator receives incoming support tickets and delegates to `billing`, `tec
 - Dynamic mode (`entry` + `canDelegate`, no `pipeline` block)
 - `delegate()` built-in tool injected into the coordinator at runtime
 - Per-role `replicas` (scale specialists independently)
-- `ArkService` with `least-busy` routing
-- `AGENT_TEAM_ROUTES` env var injected by operator (role → queue URL map)
+- `ArkEvent` webhook for external task submission
 
 ## Run it
 
 ```bash
 kubectl apply -f customer-support.yaml
 
-# Submit a ticket via the entry ArkService
-curl -X POST http://<entry-service-ip>:8081/task \
+# Get the webhook URL
+kubectl get arkevent customer-support-webhook -n ark-teams \
+  -o jsonpath='{.status.webhookURL}'
+
+# Submit a ticket
+curl -X POST "$WEBHOOK_URL" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "My invoice shows a double charge for last month."}'
+  -d '{"message": "My invoice shows a double charge for last month."}'
 ```

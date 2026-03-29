@@ -4,5 +4,20 @@
 .env.local
 .env.*.local
 
-# Claude Code AI assistant local settings
+# editor and IDE paraphernalia
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# ignore created by ai tools
 .claude/
+.cursor/
+.cursor.json
+.continue/
+.aider*
+.open-interpreter/
+
+# OS junk
+.DS_Store

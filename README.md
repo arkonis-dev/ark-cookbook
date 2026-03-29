@@ -17,13 +17,10 @@ Full documentation at **[docs.arkonis.dev](https://docs.arkonis.dev)**.
 | Recipe | Pattern | Key Features |
 |---|---|---|
 | [01-simple-pipeline](teams/01-simple-pipeline/) | Linear DAG | `pipeline`, `dependsOn`, template inputs/outputs, `outputSchema` |
-| [02-dynamic-team](teams/02-dynamic-team/) | Autonomous delegation | `entry`, `canDelegate`, `delegate()` tool, `ArkService` |
-| [03-cron-autoscale](teams/03-cron-autoscale/) | Cron + scale-to-zero | `ArkEvent` cron, KEDA `autoscaling`, `maxDailyTokens` |
-| [04-webhook-pipeline](teams/04-webhook-pipeline/) | Webhook fan-out | `ArkEvent` webhook, fan-out to multiple teams, inline `tools` |
-| [05-validated-pipeline](teams/05-validated-pipeline/) | Output validation + retry | `validate` (contains/schema/semantic), `onFailure: retry`, `loop` |
-| [06-multi-model](teams/06-multi-model/) | Cost-optimized pipeline | Mixed models per role, `ArkSettings`, conditional steps |
-| [07-supervisor-worker](teams/07-supervisor-worker/) | Horizontal scale | `submit_subtask`, `replicas`, `maxConcurrentTasks`, `least-busy` routing |
-| [08-budget-notify](teams/08-budget-notify/) | Production ops | `maxDailyTokens`, `ArkNotify`, `notifyRef`, `systemPromptRef` |
+| [02-dynamic-team](teams/02-dynamic-team/) | Autonomous delegation | `entry`, `canDelegate`, `delegate()` tool, `ArkEvent` webhook |
+| [03-budget-notify](teams/03-budget-notify/) | Production ops | `maxDailyTokens`, `ArkNotify`, `notifyRef`, `systemPromptRef` |
+| [04-single-agent](teams/04-single-agent/) | Minimal single agent | One role, one step, `outputSchema`, simplest possible setup |
+| [05-routed-team](teams/05-routed-team/) | LLM-driven dispatch | `spec.routing`, `ArkRegistry`, multi-capability agents, cron auto-routing |
 
 ## Prerequisites
 
@@ -31,18 +28,12 @@ Full documentation at **[docs.arkonis.dev](https://docs.arkonis.dev)**.
 - [ark-cli](https://github.com/arkonis-dev/ark-cli) installed
 - ark installed:
   ```bash
-  helm repo add arkonis https://arkonis-dev.github.io/helm-charts
+  helm repo add arkonis https://charts.arkonis.dev
   helm repo update
-  kubectl create secret generic ark-api-keys \
-    --namespace ark-system \
-    --create-namespace \
-    --from-literal=ANTHROPIC_API_KEY=sk-ant-...
   helm install ark arkonis/ark \
     --namespace ark-system \
-    --set apiKeys.existingSecret=ark-api-keys
+    --create-namespace
   ```
-
-For recipe 03 (autoscaling): KEDA must be installed - see [keda.sh/docs/deploy](https://keda.sh/docs/deploy/).
 
 ## Quick start
 

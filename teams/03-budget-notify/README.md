@@ -1,4 +1,4 @@
-# 08 - Budget + Notify: Analytics Team
+# 03 - Budget + Notify: Analytics Team
 
 **Pattern:** Production-grade ops - cost controls, Slack alerts, external prompt management.
 

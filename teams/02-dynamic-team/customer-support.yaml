@@ -7,20 +7,31 @@
 #
 # Features demonstrated:
 #   - Dynamic mode (autonomous delegation, no pipeline block)
-#   - entry role (receives external tasks via auto-created ArkService)
+#   - entry role (coordinator receives all inbound tasks)
 #   - canDelegate (explicit delegation graph)
 #   - delegate() built-in tool injected into coordinator at runtime
 #   - Per-role replicas (scale specialists independently)
-#   - ArkService for external task submission
+#   - ArkEvent webhook for external task submission (RFC-0021)
 #
 # Apply:
 #   kubectl apply -f secret.yaml
 #   kubectl apply -f customer-support.yaml
 #
-# Submit a ticket via the auto-created ArkService (HTTP port 8081):
-#   curl -X POST http://<arkservice-ip>:8081/task \
+# After applying, get the webhook URL and token:
+#   kubectl get arkevent support-webhook -n ark-teams \
+#     -o jsonpath='{.status.webhookURL}'
+#   kubectl get secret support-webhook-token \
+#     -o jsonpath='{.data.token}' | base64 -d
+#
+# Submit a ticket via webhook:
+#   curl -X POST "$WEBHOOK_URL" \
+#     -H "Authorization: Bearer $TOKEN" \
 #     -H "Content-Type: application/json" \
-#     -d '{"prompt": "My invoice shows a double charge for last month."}'
+#     -d '{"message": "My invoice shows a double charge for last month."}'
+#
+# Or submit directly via CLI:
+#   ark submit -n ark-teams --team customer-support-team \
+#     "My invoice shows a double charge for last month."
 #
 apiVersion: arkonis.dev/v1alpha1
 kind: ArkTeam
@@ -28,9 +39,14 @@ metadata:
   name: customer-support-team
   namespace: ark-teams
 spec:
-  # entry names the role that receives all inbound tasks from the ArkService.
-  # The operator auto-creates an ArkService named "customer-support-team-entry".
+  # entry names the role that receives all inbound tasks.
   entry: coordinator
+
+  inputs:
+    - name: message
+      type: string
+      description: "The incoming support ticket text."
+      required: true
 
   roles:
     # The coordinator receives every ticket and decides routing.
@@ -115,11 +131,6 @@ spec:
       mcpServers:
         - name: knowledge-base
           url: https://kb.mcp.example.com/sse
-          # guidance provides deployment-specific context for this MCP server.
-          # The operator injects this as a "## MCP Tool Guidance" section in the
-          # assembled system prompt so the LLM knows how to use the tool correctly
-          # in this environment. General tool documentation belongs in the MCP
-          # server's own tool descriptions.
           guidance: |
             This is the internal knowledge base for Acme Corp products. Articles
             are tagged by product line (billing, api, onboarding). Search by
@@ -150,21 +161,19 @@ spec:
           cpu: 500m
           memory: 512Mi
 ---
-# ArkService exposes the team's entry role over HTTP and agent-to-agent (A2A) protocols.
-# The operator creates this automatically when spec.entry is set, but you can declare
-# it explicitly to customize routing strategy or ports.
+# ArkEvent webhook - the external entry point for incoming support tickets.
+# Each POST creates an ArkRun targeting the coordinator role.
+# The webhook URL is exposed in status.webhookURL after applying.
 apiVersion: arkonis.dev/v1alpha1
-kind: ArkService
+kind: ArkEvent
 metadata:
-  name: customer-support-entry
+  name: support-webhook
   namespace: ark-teams
 spec:
-  selector:
-    arkAgent: customer-support-team-coordinator
-  routing:
-    strategy: least-busy   # round-robin | least-busy | random
-  ports:
-    - protocol: A2A
-      port: 8080
-    - protocol: HTTP
-      port: 8081
+  source:
+    type: webhook
+  targets:
+    - team: customer-support-team
+      input:
+        message: "{{ .trigger.body.message }}"
+  concurrencyPolicy: Allow   # Multiple tickets can be in flight simultaneously

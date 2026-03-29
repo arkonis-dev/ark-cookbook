@@ -1,4 +1,4 @@
-# 13 - Single Agent: Daily Tech Brief
+# 04 - Single Agent: Daily Tech Brief
 
 **Pattern:** Single agent - the simplest possible ark setup.
 

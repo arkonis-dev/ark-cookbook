@@ -1,0 +1,319 @@
+# 05-routed-team - Engineering Ops Router
+#
+# Demonstrates RFC-0019: ArkTeam routed mode.
+#
+# A routed team has NO pipeline and NO roles. When triggered, the operator makes a
+# single lightweight LLM call (the "router") that reads all indexed agent capabilities
+# and selects the best match for the incoming task — exactly like LLM function-calling,
+# but for your agent fleet.
+#
+# Six specialist agents cover the full engineering stack. The router dispatches each
+# task to the right one automatically. The fallback (general-assistant) handles anything
+# that doesn't map cleanly to a single specialist.
+#
+# Features demonstrated:
+#   - ArkTeam with spec.routing (routed mode — no pipeline, no roles)
+#   - spec.routing.fallback: handles cross-domain or ambiguous tasks
+#   - ArkRegistry auto-indexing standalone ArkAgents by capability
+#   - Multi-capability agents (devops-engineer handles infra + cost)
+#   - ArkEvent cron: daily standup summary routed automatically
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f ops-router.yaml
+#
+# Trigger examples:
+#   ark trigger ops-router -n ark-teams \
+#     --input '{"task": "The login button is broken on Safari iOS 17"}'
+#
+#   ark trigger ops-router -n ark-teams \
+#     --input '{"task": "Our PostgreSQL query for user search is taking 8 seconds"}'
+#
+#   ark trigger ops-router -n ark-teams \
+#     --input '{"task": "CPU on api-gateway spiked to 95% — pods are crashing"}'
+#
+#   ark trigger ops-router -n ark-teams \
+#     --input '{"task": "Review this auth middleware for security issues", "code": "..."}'
+#
+#   ark trigger ops-router -n ark-teams \
+#     --input '{"task": "Summarize key health signals for standup: incidents, costs, security findings"}'
+
+---
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkRegistry
+metadata:
+  name: ops-registry
+  namespace: ark-teams
+spec:
+  scope: namespace-scoped
+  policy:
+    maxDepth: 1
+    allowCrossTeam: false
+
+---
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: ops-router
+  namespace: ark-teams
+spec:
+  routing:
+    registryRef:
+      name: ops-registry
+    model: qwen2.5:7b
+    fallback: general-assistant
+  timeoutSeconds: 600
+  successfulRunsHistoryLimit: 20
+  failedRunsHistoryLimit: 5
+
+---
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkAgent
+metadata:
+  name: frontend-engineer
+  namespace: ark-teams
+spec:
+  replicas: 1
+  model: qwen2.5:7b
+  envFrom:
+    - secretRef:
+        name: ark-api-keys
+  systemPrompt: |
+    You are a senior frontend engineer specializing in React, TypeScript, and browser APIs.
+
+    For UI bugs: identify the root cause (rendering, state, CSS, browser quirks), explain
+    the fix, and provide a corrected code snippet.
+
+    For performance issues: diagnose paint/layout thrashing, bundle size problems, or
+    slow API waterfalls. Suggest concrete improvements with measurable impact.
+
+    For accessibility: flag WCAG violations and provide compliant alternatives.
+
+    Always tailor your answer to the specific browser/framework mentioned.
+  limits:
+    maxTokensPerCall: 4000
+    maxConcurrentTasks: 3
+    timeoutSeconds: 300
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  capabilities:
+    - id: frontend-debug
+      description: >
+        Debug and fix frontend issues: React rendering bugs, TypeScript errors, CSS
+        layout problems, browser-specific quirks, broken UI interactions, and
+        JavaScript exceptions. Use for anything related to the browser, UI, or client-side code.
+      tags: [frontend, react, typescript, css, browser]
+    - id: frontend-performance
+      description: >
+        Diagnose and improve frontend performance: slow page loads, excessive re-renders,
+        large bundle sizes, layout thrashing, long paint times, and waterfall API calls.
+        Use when users report the UI feeling slow or unresponsive.
+      tags: [frontend, performance, web-vitals]
+
+---
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkAgent
+metadata:
+  name: backend-engineer
+  namespace: ark-teams
+spec:
+  replicas: 2
+  model: qwen2.5:7b
+  envFrom:
+    - secretRef:
+        name: ark-api-keys
+  systemPrompt: |
+    You are a senior backend engineer specializing in APIs, databases, and distributed systems.
+
+    For API issues: diagnose request failures, serialization errors, auth problems, or
+    broken integrations. Provide root cause and fixed code.
+
+    For database issues: analyse slow queries, missing indexes, N+1 problems, or schema
+    design flaws. Provide the optimized query or migration.
+
+    For distributed systems: address race conditions, retry storms, cache invalidation,
+    or queue backlogs. Explain the failure mode and the fix.
+
+    Be specific — include query plans, error messages, and code snippets in your response.
+  limits:
+    maxTokensPerCall: 5000
+    maxConcurrentTasks: 4
+    timeoutSeconds: 300
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  capabilities:
+    - id: backend-debug
+      description: >
+        Debug backend issues: API errors (5xx, timeouts, wrong responses), broken
+        integrations, authentication failures, serialization bugs, and service-to-service
+        communication problems. Use for anything broken on the server side.
+      tags: [backend, api, rest, grpc, debugging]
+    - id: database-query
+      description: >
+        Optimise and fix database queries: slow SELECT performance, missing indexes,
+        N+1 query patterns, deadlocks, schema migrations, and ORM misuse.
+        Use for any question involving SQL, query plans, or database performance.
+      tags: [database, sql, postgres, mysql, performance]
+
+---
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkAgent
+metadata:
+  name: devops-engineer
+  namespace: ark-teams
+spec:
+  replicas: 2
+  model: qwen2.5:7b
+  envFrom:
+    - secretRef:
+        name: ark-api-keys
+  systemPrompt: |
+    You are a senior DevOps/SRE engineer covering infrastructure, deployments, and cost.
+
+    For incidents: identify root cause (CPU, memory, network, pod crashes, dependency failures),
+    list immediate mitigation steps, and suggest diagnostic commands.
+
+    For deployments: diagnose rollout failures, misconfigured manifests, image pull errors,
+    resource limits, or broken health checks.
+
+    For cost: identify top spend drivers, flag anomalies, and suggest right-sizing or
+    architectural changes with estimated savings.
+
+    Be direct and action-oriented. Engineers reading this may be under pressure.
+  limits:
+    maxTokensPerCall: 4000
+    maxConcurrentTasks: 4
+    timeoutSeconds: 300
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  capabilities:
+    - id: incident-response
+      description: >
+        Diagnose and triage production incidents: CPU spikes, memory leaks, pod crashes,
+        latency regressions, error rate increases, and downstream dependency failures.
+        Use for any alert, PagerDuty page, or "something is broken in prod" message.
+      tags: [sre, incidents, production, kubernetes, oncall]
+    - id: deployment-debug
+      description: >
+        Debug deployment and infrastructure issues: failed rollouts, CrashLoopBackOff pods,
+        misconfigured Kubernetes manifests, image pull errors, broken CI/CD pipelines,
+        and Helm release failures.
+      tags: [devops, kubernetes, helm, ci-cd, deployment]
+    - id: cloud-cost
+      description: >
+        Analyse cloud infrastructure costs and recommend optimisations: compute right-sizing,
+        reserved instance strategy, data transfer reduction, storage tiering, idle resource
+        cleanup. Use for billing questions, cost spikes, or spend reviews.
+      tags: [finops, cost, cloud, aws, gcp, azure]
+
+---
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkAgent
+metadata:
+  name: security-auditor
+  namespace: ark-teams
+spec:
+  replicas: 1
+  model: qwen2.5:7b
+  envFrom:
+    - secretRef:
+        name: ark-api-keys
+  systemPrompt: |
+    You are a security engineer specialising in application and infrastructure security.
+
+    For code reviews: identify OWASP Top 10 vulnerabilities, insecure patterns, and
+    hardcoded secrets. Return findings as a structured list:
+      - Severity: CRITICAL / HIGH / MEDIUM / LOW
+      - Issue: one-sentence description
+      - Fix: concrete remediation with corrected code where applicable
+
+    For infrastructure reviews: check IAM over-permissions, exposed ports, missing
+    encryption, weak network policies, and secret management gaps.
+
+    Always explain the attack vector — not just the rule violated.
+  limits:
+    maxTokensPerCall: 5000
+    maxConcurrentTasks: 2
+    timeoutSeconds: 300
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  capabilities:
+    - id: security-review
+      description: >
+        Review code or infrastructure for security vulnerabilities: SQL injection, XSS,
+        SSRF, broken auth, hardcoded secrets, overly permissive IAM, missing encryption,
+        insecure dependencies. Use for code review requests, security audits, or
+        "is this safe to deploy?" questions.
+      tags: [security, owasp, code-review, compliance, iam]
+
+---
+# Fallback: handles cross-domain questions and anything the router can't map to a
+# single specialist — e.g. "standup summary covering incidents, costs, and security".
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkAgent
+metadata:
+  name: general-assistant
+  namespace: ark-teams
+spec:
+  replicas: 1
+  model: qwen2.5:7b
+  envFrom:
+    - secretRef:
+        name: ark-api-keys
+  systemPrompt: |
+    You are a helpful assistant for software engineering and operations teams.
+    You have broad knowledge across frontend, backend, DevOps, security, and cloud.
+
+    Answer questions clearly and concisely. For cross-domain questions (e.g. standup
+    summaries covering incidents, costs, and security findings), synthesise the relevant
+    signals into a single coherent response.
+  limits:
+    maxTokensPerCall: 3000
+    timeoutSeconds: 300
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+---
+# Daily standup summary — cross-domain, so the router falls back to general-assistant
+# which has a broad enough system prompt to synthesise signals across all domains.
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkEvent
+metadata:
+  name: daily-ops-summary
+  namespace: ark-teams
+spec:
+  source:
+    type: cron
+    cron: "0 8 * * 1-5"   # weekdays at 08:00 UTC
+  targets:
+    - team: ops-router
+      input:
+        task: >
+          Summarize the key operational health signals for today's standup:
+          check for any ongoing incidents, recent cost anomalies, and open
+          security findings. Keep it under 5 bullet points.

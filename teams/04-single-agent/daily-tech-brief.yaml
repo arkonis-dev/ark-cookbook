@@ -1,4 +1,4 @@
-# 13-single-agent - Daily Tech Brief
+# 04-single-agent - Daily Tech Brief
 #
 # A single-agent pipeline that generates a structured tech brief for a given topic.
 # The simplest possible ark setup: one role, one step, one output.
@@ -38,7 +38,7 @@ spec:
 
   roles:
     - name: analyst
-      model: claude-sonnet-4-20250514
+      model: qwen2.5:7b
       envFrom:
         - secretRef:
             name: ark-api-keys
