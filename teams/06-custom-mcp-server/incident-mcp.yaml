@@ -1,0 +1,76 @@
+# incident-mcp — Kubernetes deployment for the custom MCP server.
+#
+# Build and deploy:
+#   docker build -t incident-mcp:latest ./src
+#   kubectl apply -f incident-mcp.yaml
+#
+# The server exposes the MCP SSE endpoint at:
+#   http://incident-mcp.ark-teams.svc.cluster.local:8099/sse
+#
+# Docker Desktop: the image is available immediately after build (shared daemon).
+# Other clusters:  push to a registry and update spec.containers[0].image below.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: incident-mcp
+  namespace: ark-teams
+  labels:
+    app: incident-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: incident-mcp
+  template:
+    metadata:
+      labels:
+        app: incident-mcp
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: incident-mcp
+          image: incident-mcp:latest
+          imagePullPolicy: Never  # Docker Desktop — image is local
+          ports:
+            - containerPort: 8099
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8099
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8099
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: incident-mcp
+  namespace: ark-teams
+spec:
+  selector:
+    app: incident-mcp
+  ports:
+    - port: 8099
+      targetPort: 8099

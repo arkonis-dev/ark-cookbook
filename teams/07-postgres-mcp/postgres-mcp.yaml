@@ -1,0 +1,85 @@
+# Postgres MCP server — exposes list_tables, describe_table, run_query.
+#
+# Build and apply:
+#   docker build -t postgres-mcp:latest ./src
+#   kubectl apply -f postgres-mcp.yaml
+#   kubectl wait --for=condition=ready pod -l app=postgres-mcp -n ark-teams --timeout=60s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-mcp
+  namespace: ark-teams
+  labels:
+    app: postgres-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-mcp
+  template:
+    metadata:
+      labels:
+        app: postgres-mcp
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres-mcp
+          image: postgres-mcp:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8099
+          env:
+            - name: DB_HOST
+              value: postgres.ark-infra.svc.cluster.local
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: appdb
+            - name: DB_USER
+              value: appuser
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: DB_PASSWORD
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8099
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8099
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-mcp
+  namespace: ark-teams
+spec:
+  selector:
+    app: postgres-mcp
+  ports:
+    - port: 8099
+      targetPort: 8099

@@ -1,0 +1,188 @@
+# 07-postgres-mcp — Database Analysis Team
+#
+# Three agents collaborate over a live Postgres database via a custom MCP server.
+# Each agent calls real SQL queries — the data and findings are not mocked.
+#
+# Features demonstrated:
+#   - Custom MCP server backed by a real database
+#   - Parallel steps: analyst and auditor both depend on reader, run concurrently
+#   - Three distinct reasoning styles over the same data source
+#   - Security findings from real data patterns (not hardcoded)
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f postgres.yaml
+#   kubectl apply -f postgres-mcp.yaml
+#   kubectl apply -f data-team.yaml
+#   kubectl wait --for=condition=ready pod -l app=postgres -n ark-teams --timeout=60s
+#   kubectl wait --for=condition=ready pod -l app=postgres-mcp -n ark-teams --timeout=60s
+#
+# Trigger:
+#   ark trigger data-team -n ark-teams
+
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: data-team
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 600
+
+  roles:
+    # ------------------------------------------------------------------
+    # reader: discovers schema and collects raw data summaries.
+    # Runs first. Its output feeds both analyst and auditor.
+    # ------------------------------------------------------------------
+    - name: reader
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      mcpServers:
+        - name: db
+          url: http://postgres-mcp.ark-teams.svc.cluster.local:8099
+      systemPrompt: |
+        You are a database reader agent. Your job is to explore the database
+        schema and collect a concise factual summary of what is in it.
+
+        Steps:
+        1. Call list_tables to get all table names.
+        2. Call describe_table for each table to get column definitions.
+        3. For each table call run_query with SELECT COUNT(*) to get row counts.
+        4. For each table call run_query with SELECT * ... LIMIT 5 to sample rows.
+
+        Return a JSON object with this exact structure — nothing else:
+        {
+          "tables": {
+            "<table_name>": {
+              "row_count": <number>,
+              "columns": [{"column_name":"...","data_type":"...","is_nullable":"..."}],
+              "sample_rows": [...]
+            }
+          }
+        }
+      limits:
+        maxTokensPerCall: 6000
+        timeoutSeconds: 180
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # ------------------------------------------------------------------
+    # analyst: runs aggregation queries, finds patterns and trends.
+    # Runs in parallel with auditor after reader completes.
+    # ------------------------------------------------------------------
+    - name: analyst
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      mcpServers:
+        - name: db
+          url: http://postgres-mcp.ark-teams.svc.cluster.local:8099
+      systemPrompt: |
+        You are a data analyst agent. Given a database schema summary, run
+        analytical SQL queries to surface patterns and business insights.
+
+        Focus on:
+        - User activity distribution (active vs inactive, role breakdown)
+        - Order volume, total revenue, average order value, status breakdown
+        - API key coverage (how many users have keys, expiry distribution)
+
+        Use run_query to execute your queries. Write clear, concise findings.
+        Format output as a short report with section headings. Plain text only.
+      limits:
+        maxTokensPerCall: 4000
+        timeoutSeconds: 180
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # ------------------------------------------------------------------
+    # auditor: hunts security issues using targeted SQL queries.
+    # Runs in parallel with analyst after reader completes.
+    # ------------------------------------------------------------------
+    - name: auditor
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      mcpServers:
+        - name: db
+          url: http://postgres-mcp.ark-teams.svc.cluster.local:8099
+      systemPrompt: |
+        You are a security auditor agent. Given a database schema, run targeted
+        SQL queries to find security risks in the data.
+
+        Check for all of the following — write a query for each:
+        1. Dormant privileged accounts: admin or superadmin users with last_login
+           more than 90 days ago and is_active = true.
+        2. Brute-force targets: users with failed_login_attempts >= 5.
+        3. Ghost accounts with high-value orders: users who have never logged in
+           (last_login IS NULL) but have orders over $1,000.
+        4. Expired API keys still in use: keys where expires_at < NOW() but
+           last_used > expires_at.
+        5. No-expiry high-privilege keys: API keys with expires_at IS NULL and
+           permissions containing 'admin' or 'superadmin'.
+        6. Keys belonging to disabled accounts: API keys where the owning user
+           has is_active = false.
+
+        For each finding, report:
+          - Severity: CRITICAL / HIGH / MEDIUM
+          - Issue: one sentence
+          - Affected rows: the actual query results (IDs, emails, etc.)
+          - Recommended action: one sentence
+
+        Use run_query to execute each check. Only report findings that return
+        actual rows — skip checks with no results.
+      limits:
+        maxTokensPerCall: 6000
+        timeoutSeconds: 180
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+  pipeline:
+    - role: reader
+      inputs:
+        prompt: |
+          Explore the database schema and return a structured JSON summary.
+
+    - role: analyst
+      dependsOn: [reader]
+      inputs:
+        prompt: |
+          Database schema and sample data:
+          {{ .steps.reader.output }}
+
+          Run analytical queries and write a data insights report.
+
+    - role: auditor
+      dependsOn: [reader]
+      inputs:
+        prompt: |
+          Database schema and sample data:
+          {{ .steps.reader.output }}
+
+          Run security checks and report all findings with severity ratings.
+
+  output: |
+    DATA INSIGHTS
+    =============
+    {{ .steps.analyst.output }}
+
+    SECURITY REPORT
+    ===============
+    {{ .steps.auditor.output }}

@@ -1,0 +1,181 @@
+# 06-custom-mcp-server — Incident Triage Team
+#
+# A three-step pipeline where every agent role uses a custom MCP server
+# deployed in the same namespace. The MCP server exposes three tools:
+#   - list_incidents         (read)
+#   - get_incident_details   (read)
+#   - escalate_incident      (write)
+#
+# This demonstrates how to wire a custom MCP server into an ArkTeam:
+# set spec.roles[*].mcpServers[].url to the in-cluster Service endpoint.
+#
+# Features demonstrated:
+#   - spec.roles[*].mcpServers — connecting agents to a custom MCP server
+#   - Read tools (list, detail lookup) and write/action tools (escalate)
+#   - Chaining tool-calling steps: triage feeds runbook; runbook feeds escalation
+#   - outputSchema validation on the triage step
+#
+# Apply:
+#   kubectl apply -f secret.yaml
+#   kubectl apply -f incident-mcp.yaml
+#   kubectl apply -f incident-team.yaml
+#
+# Trigger:
+#   ark trigger incident-triage-team -n ark-teams \
+#     --input '{"severity_filter":"critical"}'
+
+apiVersion: arkonis.dev/v1alpha1
+kind: ArkTeam
+metadata:
+  name: incident-triage-team
+  namespace: ark-teams
+spec:
+  timeoutSeconds: 600
+
+  inputs:
+    - name: severity_filter
+      type: string
+      description: "Only report incidents at this severity level or above. One of: critical, high, medium, all."
+      required: false
+      default: "all"
+
+  roles:
+    # Step 1: fetch and classify all active incidents.
+    - name: triage
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      mcpServers:
+        - name: incidents
+          url: http://incident-mcp.ark-teams.svc.cluster.local:8099
+      systemPrompt: |
+        You are an SRE on-call triage agent. You have access to the incident management
+        system via the incidents MCP server.
+
+        When asked to triage incidents:
+        1. Call list_incidents to get all active incidents.
+        2. Filter to the requested severity (or include all if severity_filter is "all").
+        3. Call get_incident_details for each matching incident to get full descriptions.
+        4. Return a JSON array — nothing else. No explanation, no markdown.
+      limits:
+        maxTokensPerCall: 4000
+        timeoutSeconds: 120
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # Step 2: write a diagnostic runbook for the most critical open incident.
+    - name: runbook
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      mcpServers:
+        - name: incidents
+          url: http://incident-mcp.ark-teams.svc.cluster.local:8099
+      systemPrompt: |
+        You are a senior SRE writing diagnostic runbooks. Given a list of incidents,
+        identify the single most critical one (highest severity, longest open) and
+        write a concise runbook covering:
+          - Likely root causes (2-3 candidates)
+          - Immediate mitigation steps (numbered list)
+          - Diagnostic commands to run
+          - Escalation criteria
+
+        You may call get_incident_details if you need more context on a specific incident.
+        Format the runbook in plain text. Keep it under 400 words.
+      limits:
+        maxTokensPerCall: 3000
+        timeoutSeconds: 120
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    # Step 3: decide whether to escalate and call escalate_incident if warranted.
+    - name: escalation
+      model: qwen2.5:7b
+      envFrom:
+        - secretRef:
+            name: ark-api-keys
+      mcpServers:
+        - name: incidents
+          url: http://incident-mcp.ark-teams.svc.cluster.local:8099
+      systemPrompt: |
+        You are an escalation decision agent. Escalation criteria:
+          - Severity is "critical" AND the incident has been open more than 30 minutes
+            without being escalated.
+
+        Review the triage data. For each incident that meets the criteria, call
+        escalate_incident with its ID.
+
+        After taking any escalation actions, return a brief summary of what you did
+        and why (or why no escalation was needed). Plain text, 3-5 sentences.
+      limits:
+        maxTokensPerCall: 2000
+        timeoutSeconds: 120
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+  pipeline:
+    - role: triage
+      inputs:
+        prompt: |
+          Triage all active incidents. severity_filter: {{ .input.severity_filter }}
+          Return a JSON array of incident objects with all details.
+      outputSchema: |
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id":          { "type": "string" },
+              "title":       { "type": "string" },
+              "severity":    { "type": "string" },
+              "status":      { "type": "string" },
+              "age_minutes": { "type": "number" },
+              "description": { "type": "string" }
+            },
+            "required": ["id", "severity"]
+          }
+        }
+
+    - role: runbook
+      dependsOn: [triage]
+      inputs:
+        prompt: |
+          Here are the active incidents:
+          {{ .steps.triage.output }}
+
+          Write a diagnostic runbook for the most critical open incident.
+
+    - role: escalation
+      dependsOn: [triage]
+      inputs:
+        prompt: |
+          Here are the active incidents:
+          {{ .steps.triage.output }}
+
+          Apply the escalation criteria and take action.
+
+  output: |
+    RUNBOOK
+    =======
+    {{ .steps.runbook.output }}
+
+    ESCALATION SUMMARY
+    ==================
+    {{ .steps.escalation.output }}
